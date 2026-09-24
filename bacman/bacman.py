@@ -1,168 +1,195 @@
-# -*- coding: utf-8 -*-
+"""Base class for taking database snapshots and shipping them to AWS S3."""
 
-# Setup logger
 import logging
-logging.basicConfig(level=logging.INFO,
-                    format="[%(asctime)s] %(levelname)s [%(name)s:%(lineno)s] %(message)s",
-                    datefmt="%Y-%m-%d %H:%M:%S")
+import os
+import time
+from dataclasses import dataclass, field
+from datetime import UTC, datetime, timedelta
+from functools import cached_property
+from pathlib import Path
+from urllib.parse import unquote, urlsplit
+
 logger = logging.getLogger(__name__)
 
-import boto
-import dj_database_url
-import os
-import subprocess
+DEFAULT_KEEP_HOURS = 720  # 30 days
 
-from datetime import datetime, timedelta
 
-from boto.s3.key import Key
+@dataclass(frozen=True)
+class Database:
+    """Connection details parsed from a database URL."""
 
-from .utils import is_positive_number
+    name: str
+    user: str = ""
+    password: str = field(default="", repr=False)
+    host: str = ""
+    port: int | None = None
+
+    @classmethod
+    def from_url(cls, url: str) -> "Database":
+        """Parse ``scheme://user:password@host:port/name``.
+
+        Percent-encoded parts are decoded, so a Unix socket directory can be
+        given as the host, e.g. ``postgres://%2Fvar%2Frun%2Fpostgresql/db``.
+        """
+        parts = urlsplit(url)
+        name = unquote(parts.path.lstrip("/"))
+        if not name:
+            raise ValueError("Database URL has no database name")
+        return cls(
+            name=name,
+            user=unquote(parts.username or ""),
+            password=unquote(parts.password or ""),
+            host=unquote(parts.hostname or ""),
+            port=parts.port,
+        )
+
+
+def _max_age(hours: float) -> timedelta:
+    if isinstance(hours, bool) or not hours > 0:
+        raise ValueError(f"Expected a positive number of hours, got {hours!r}")
+    return timedelta(hours=hours)
 
 
 class BacMan:
-    """ Base class with some common functionality for taking database snapshots """
+    """Take a snapshot of a database, upload it to S3 and prune old snapshots.
 
-    url = dj_database_url.parse(os.environ['DATABASE_URL'])
+    Settings not passed explicitly are read from the environment when the
+    instance is created: ``DATABASE_URL``, ``BACMAN_DIRECTORY``,
+    ``BACMAN_PREFIX``, ``BACMAN_BUCKET`` and ``BACMAN_REGION``. AWS
+    credentials are resolved by boto3 (environment, config files or IAM role).
 
-    user = url['USER']
-    password = url['PASSWORD']
-    name = url['NAME']
-    host = url['HOST']
-    port = url['PORT']
+    Subclasses set :attr:`prefix` and :attr:`suffix` and implement :meth:`dump`.
+    """
 
-    aws_key = os.environ.get('AWS_ACCESS_KEY_ID', None)
-    aws_secret = os.environ.get('AWS_SECRET_ACCESS_KEY', None)
-    bacman_bucket = os.environ.get('BACMAN_BUCKET', None)
-    bacman_region = os.environ.get('BACMAN_REGION', 'eu-west-1')
-
-    directory = os.environ.get('BACMAN_DIRECTORY', '/tmp/bacman')
-    filename_prefix = os.environ.get('BACMAN_PREFIX', 'sqldump')
-
-    conn = None
-    bucket = None
-
+    prefix = "sqldump"
     suffix = "sql"
 
-    def __init__(self, to_remote=False, cleanup_remote_snapshots=False, cleanup_local_snapshots=False,
-                 remote_snapshot_timeout=None, local_snapshot_timeout=None):
+    def __init__(
+        self,
+        database_url: str | None = None,
+        *,
+        directory: str | os.PathLike | None = None,
+        prefix: str | None = None,
+        bucket: str | None = None,
+        region: str | None = None,
+    ) -> None:
+        url = database_url or os.environ.get("DATABASE_URL")
+        if not url:
+            raise ValueError("No database URL given and DATABASE_URL is not set")
+        self.db = Database.from_url(url)
+        self.directory = Path(directory or os.environ.get("BACMAN_DIRECTORY", "/tmp/bacman"))
+        self.prefix = prefix or os.environ.get("BACMAN_PREFIX") or self.prefix
+        self.bucket = bucket or os.environ.get("BACMAN_BUCKET")
+        self.region = region or os.environ.get("BACMAN_REGION", "eu-west-1")
 
-        # 1. Check that proper directory exists in file system
-        # 2. Generate filename for snapshot
-        # 3. Take snapshot of database
-        # 4. Set timeout value in hours for remote snapshot, if invalid or None, use the default of 720 hours = 30 days
-        # 5. Set timeout value in hours for local snapshot, if invalid or None, use the default of 720 hours = 30 days
-        # 6. If 'to_remote' is True, try to connect to remote storage and upload newly created snapshot
-        # 7. If 'cleanup_remote_snapshots' is True, try to connect to remote storage and remove outdated snapshots
-        # 8. If 'cleanup_local_snapshots' is True, try to remove outdated snapshots from local file system
+    def run(
+        self,
+        *,
+        upload: bool = False,
+        keep_local: float | None = None,
+        keep_remote: float | None = None,
+    ) -> Path:
+        """Take a snapshot, then optionally upload it and prune old snapshots.
 
-        # Check if directory exists
-        self.check_directory()
+        ``keep_local`` / ``keep_remote`` are ages in hours: older snapshots are
+        deleted locally / from the bucket. ``None`` leaves them alone.
+        Returns the path of the new snapshot.
+        """
+        # Validate everything up front rather than failing after a long dump.
+        for hours in (keep_local, keep_remote):
+            if hours is not None:
+                _max_age(hours)
+        if upload or keep_remote is not None:
+            self._require_bucket()
 
-        # Generate file name
-        path = self.generate_file_name()
-        logger.info("Creating a pg_dump file in {} ...".format(path))
-        path = self.create_snapshot(path)
+        path = self.snapshot()
+        if upload:
+            self.upload(path)
+        if keep_remote is not None:
+            self.prune_remote(keep_remote)
+        if keep_local is not None:
+            self.prune_local(keep_local)
+        return path
 
-        if cleanup_remote_snapshots:
-            # How many hours should we keep the files in our S3 bucket?
-            self.remote_snapshot_timeout = datetime.now() - timedelta(hours=720)
-            if remote_snapshot_timeout is not None:
-                if is_positive_number(remote_snapshot_timeout):
-                    self.remote_snapshot_timeout = datetime.now() - timedelta(hours=remote_snapshot_timeout)
-                else:
-                    message = "Invalid parameter passed for 'remote_snapshot_timeout'. Using default: {} hours!".format(
-                        self.remote_snapshot_timeout
-                    )
-                    logger.info(message)
+    def dump(self, path: Path) -> None:
+        """Write a dump of the database to ``path``."""
+        raise NotImplementedError
 
-        if cleanup_local_snapshots:
-            # How many hours should we keep the files in our local filesystem?
-            self.local_snapshot_timeout = datetime.now() - timedelta(hours=720)
-            if local_snapshot_timeout is not None:
-                if is_positive_number(local_snapshot_timeout):
-                    self.local_snapshot_timeout = datetime.now() - timedelta(hours=local_snapshot_timeout)
-                else:
-                    message = "Invalid parameter passed for 'local_snapshot_timeout'. Using default: {} hours!".format(
-                        self.local_snapshot_timeout
-                    )
-                    logger.info(message)
-
-        if to_remote:
-            # Check that valid aws_key and aws_secret is set
-            if self.aws_key is not None and self.aws_secret is not None:
-                self.conn = boto.s3.connect_to_region(
-                    self.bacman_region,
-                    aws_access_key_id=self.aws_key,
-                    aws_secret_access_key=self.aws_secret,
-                    is_secure=True)
-
-            self.bucket = self.conn.get_bucket(self.bacman_bucket)
-            logger.info("Uploading file {} to S3 bucket ({}) ...".format(path, self.bacman_bucket))
-            self.upload_snapshot(path)
-            logger.info("File upload was successful...")
-
-        if cleanup_remote_snapshots:
-            logger.info("Attempting to remove old backups from bucket {} ...".format(self.bacman_bucket))
-            self.remove_outdated_remote_snapshots()
-            logger.info("Successfully removed old backups from bucket {} ...".format(self.bacman_bucket))
-
-        if cleanup_local_snapshots:
-            logger.info("Attempting to remove old backups from {} ...".format(self.directory))
-            self.remove_outdated_local_snapshots()
-            logger.info("Successfully removed old backups from {} ...".format(self.directory))
-
-    def generate_file_name(self):
-        # Returns the path and filename of the created file
-        now = datetime.now()
-        filename = "{}-{}-{}.{}".format(self.filename_prefix,
-                                        now.date().strftime('%Y%m%d'),
-                                        now.time().strftime('%H%M%S'),
-                                        self.suffix)
-        return os.path.realpath(os.path.join(self.directory, filename))
-
-    def get_command(self, path):
-        raise NotImplementedError("Please implement this function in a subclass!")
-
-    def check_directory(self):
-        # Check if path exists
-        if not os.path.exists(self.directory):
-            logger.info("Creating directory {} ...".format(self.directory))
-            os.makedirs(self.directory)
-
-    def create_snapshot(self, path):
+    def snapshot(self) -> Path:
+        """Dump the database into a new timestamped file and return its path."""
+        self.directory.mkdir(parents=True, exist_ok=True)
+        stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+        path = (self.directory / f"{self.prefix}-{stamp}.{self.suffix}").resolve()
+        logger.info("Dumping database %r to %s", self.db.name, path)
         try:
-            subprocess.call(self.get_command(path), shell=True)
-            return path
-        except Exception as e:
-            # TODO: Send mail to alert settings.admin
-            logger.exception(e)
-            raise e
+            self.dump(path)
+        except BaseException:
+            path.unlink(missing_ok=True)  # don't leave a partial dump behind
+            raise
+        return path
 
-    def upload_snapshot(self, path):
-        k = Key(self.bucket)
-        # Set key to filename only
-        k.key = path.split('/')[-1]
-        k.set_contents_from_filename(path)
+    def is_snapshot(self, name: str) -> bool:
+        """Whether a file or object name looks like one of our snapshots."""
+        return name.startswith(f"{self.prefix}-") and name.endswith(f".{self.suffix}")
 
-    def remove_outdated_remote_snapshots(self):
-        # Delete files older than a certain period from bucket.
-        for key in self.bucket.list():
-            timestamp = datetime.strptime(key.last_modified, '%Y-%m-%dT%H:%M:%S.%fZ')
-            logger.info("Checking remote file {} with <Timestamp: {}>...".format(key, timestamp))
-            if timestamp < self.remote_snapshot_timeout:
-                logger.info("Deleting file <{}> from remote storage...".format(key))
-                self.bucket.delete_key(key)
+    def prune_local(self, hours: float = DEFAULT_KEEP_HOURS) -> list[Path]:
+        """Delete local snapshots older than ``hours``. Returns deleted paths."""
+        cutoff = time.time() - _max_age(hours).total_seconds()
+        if not self.directory.is_dir():
+            return []
+        deleted = []
+        for path in self.directory.iterdir():
+            if self.is_snapshot(path.name) and path.is_file() and path.stat().st_mtime < cutoff:
+                logger.info("Deleting local snapshot %s", path)
+                path.unlink()
+                deleted.append(path)
+        return deleted
 
-    def remove_outdated_local_snapshots(self):
-        # Delete files from local folder
-        for _file in os.listdir(self.directory):
-            if _file.startswith(self.filename_prefix):
-                path = os.path.realpath(os.path.join(self.directory, _file))
-                if os.path.exists(path):
-                    t = os.path.getmtime(path)
-                    timestamp = datetime.fromtimestamp(t)
-                    if timestamp < self.local_snapshot_timeout:
-                        logger.info("Deleting file <{}> from local file system...".format(path))
-                        os.remove(path)
+    @cached_property
+    def s3(self):
+        """boto3 S3 client, created on first use."""
+        import boto3  # imported lazily so local-only backups stay fast
 
-        logger.info('Removed outdated snapshots from directory {}...'.format(self.directory))
+        return boto3.client("s3", region_name=self.region)
+
+    def _require_bucket(self) -> str:
+        if not self.bucket:
+            raise ValueError("No S3 bucket given and BACMAN_BUCKET is not set")
+        return self.bucket
+
+    def upload(self, path: str | os.PathLike) -> str:
+        """Upload a snapshot to the bucket under its file name. Returns the key."""
+        bucket = self._require_bucket()
+        key = Path(path).name
+        logger.info("Uploading %s to s3://%s/%s", path, bucket, key)
+        self.s3.upload_file(os.fspath(path), bucket, key)
+        return key
+
+    def prune_remote(self, hours: float = DEFAULT_KEEP_HOURS) -> list[str]:
+        """Delete snapshots older than ``hours`` from the bucket. Returns deleted keys.
+
+        Only objects named like our snapshots (``<prefix>-*.<suffix>``) are
+        touched, so the bucket can safely hold other files.
+        """
+        cutoff = datetime.now(UTC) - _max_age(hours)
+        bucket = self._require_bucket()
+        deleted = []
+        pages = self.s3.get_paginator("list_objects_v2").paginate(
+            Bucket=bucket, Prefix=f"{self.prefix}-"
+        )
+        for page in pages:
+            keys = [
+                obj["Key"]
+                for obj in page.get("Contents", [])
+                if self.is_snapshot(obj["Key"]) and obj["LastModified"] < cutoff
+            ]
+            if not keys:
+                continue
+            logger.info("Deleting %d snapshot(s) from s3://%s: %s", len(keys), bucket, keys)
+            response = self.s3.delete_objects(
+                Bucket=bucket, Delete={"Objects": [{"Key": k} for k in keys], "Quiet": True}
+            )
+            if errors := response.get("Errors"):
+                raise RuntimeError(f"Failed to delete from s3://{bucket}: {errors}")
+            deleted += keys
+        return deleted

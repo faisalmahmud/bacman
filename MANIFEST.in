@@ -1,3 +1,0 @@
-include README.md LICENCE
-recursive-include bacman *.py
-recursive-exclude bacman *.pyc

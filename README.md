@@ -1,132 +1,109 @@
 # bacman
 
-A simple library that takes a snapshot of a Postgres or MySQL database and uploads it to AWS S3.
+A small tool that takes a snapshot of a Postgres or MySQL database, uploads it
+to AWS S3 and prunes old snapshots.
+
+Requires Python 3.11+ and `pg_dump` / `mysqldump` on the `PATH`.
 
 ## Installation
-
-**Step 1:** - Install it
 
 ```bash
 pip install bacman
 ```
 
-**Step 2:** Add proper environment variables in your `/etc/environment` or `.pam_environment`
+## Configuration
+
+Settings are read from the environment (e.g. `/etc/environment`, a systemd
+unit or your crontab):
+
+| Variable           | Description                                   | Default                                 |
+| ------------------ | --------------------------------------------- | --------------------------------------- |
+| `DATABASE_URL`     | e.g. `postgres://user:pass@localhost:5432/db` | required                                |
+| `BACMAN_DIRECTORY` | Where snapshots are written                   | `/tmp/bacman`                           |
+| `BACMAN_PREFIX`    | Snapshot file name prefix                     | `pgdump` (Postgres), `mysqldump` (MySQL) |
+| `BACMAN_BUCKET`    | S3 bucket to upload to                        | required for S3                         |
+| `BACMAN_REGION`    | S3 region                                     | `eu-west-1`                             |
+
+Special characters in the URL's password must be percent-encoded (`@` → `%40`).
+
+AWS credentials are picked up by boto3 the usual way: `AWS_ACCESS_KEY_ID` /
+`AWS_SECRET_ACCESS_KEY`, `~/.aws/credentials`, or an IAM role.
+
+Snapshots are named `<prefix>-YYYYMMDD-HHMMSS.<bak|sql>`. Pruning only ever
+touches files and S3 objects that match that pattern, so the directory and
+bucket can safely hold other files.
+
+## Command line
 
 ```bash
-DATABASE_URL="postgres://dbuser:dbpass@localhost:5432/dbname"
+# Snapshot only
+bacman postgres
 
-AWS_SECRET_ACCESS_KEY="YOURAWSSECRETACCESSKEYABCDEFGHIJKLMNOPQR"
-AWS_ACCESS_KEY_ID="YOURAWSACCESSKEYIDAB"
+# Snapshot, upload to S3, delete local snapshots older than 24 hours
+# and S3 snapshots older than 30 days
+bacman postgres --upload --keep-local 24 --keep-remote 720
 
-BACMAN_BUCKET="bacman-example"
-BACMAN_DIRECTORY="/home/bacman/backups"
-BACMAN_REGION="eu-west-1"
+bacman mysql --help
 ```
 
-**Step 3:** Create .py file with the contents below
+The command exits with a non-zero status if anything fails, so it plays well
+with cron and monitoring. For example, to take a snapshot every 2 hours:
+
+```
+0 */2 * * * /path/to/venv/bin/bacman postgres --upload --keep-local 48 >> /var/log/bacman.log 2>&1
+```
+
+## Python
 
 ```python
-from bacman.postgres import Postgres
+from bacman import Postgres
 
-Postgres(cleanup_local_snapshots=True)
+Postgres().run(upload=True, keep_local=24, keep_remote=720)
 ```
 
-or
+Settings can also be passed explicitly instead of via the environment:
 
 ```python
-from bacman.postgres import Postgres
+from bacman import MySQL
 
-Postgres(cleanup_local_snapshots=True, local_snapshot_timeout=24)
+backup = MySQL("mysql://user:pass@localhost/shop", directory="/backups", bucket="my-bucket")
+path = backup.snapshot()  # just take a snapshot
+backup.upload(path)  # upload a file to the bucket
+backup.prune_local(hours=24)  # delete old local snapshots
+backup.prune_remote(hours=720)  # delete old snapshots from the bucket
 ```
 
-## Settings
+Passwords are handed to `pg_dump` / `mysqldump` via the environment or a
+private temporary file, never on the command line.
 
-### DATABASE
+## Upgrading from 0.x
 
-**DATABASE_URL**
+1.0 requires Python 3.11+, replaces `boto` with `boto3` and drops
+`dj-database-url`. The API is now explicit instead of doing everything in the
+constructor:
 
-Please add the `DATABASE_URL` variable to your `/etc/environment` or `.pam_environment`
+| 0.x                                                        | 1.0                              |
+| ---------------------------------------------------------- | -------------------------------- |
+| `Postgres()`                                               | `Postgres().run()`               |
+| `Postgres(to_remote=True)`                                 | `Postgres().run(upload=True)`    |
+| `Postgres(cleanup_local_snapshots=True)`                   | `Postgres().run(keep_local=720)` |
+| `Postgres(cleanup_local_snapshots=True, local_snapshot_timeout=24)`   | `Postgres().run(keep_local=24)`  |
+| `Postgres(cleanup_remote_snapshots=True, remote_snapshot_timeout=24)` | `Postgres().run(keep_remote=24)` |
 
-Read more at https://github.com/kennethreitz/dj-database-url
+Other changes:
 
-### Amazon Web Services
+- Remote cleanup only deletes objects named like bacman snapshots instead of
+  everything in the bucket, and compares timestamps in UTC.
+- A failed dump raises an error (non-zero exit on the CLI) and leaves no
+  partial file behind, instead of being silently ignored.
+- Invalid ages raise `ValueError` instead of falling back to the default.
+- Settings are read when the object is created rather than at import time,
+  and importing bacman no longer configures logging.
+- The MySQL port from `DATABASE_URL` is now honoured.
 
-**AWS_ACCESS_KEY_ID**
-
-Please add the `AWS_ACCESS_KEY_ID` variable to your `/etc/environment` or `.pam_environment`
-
-**AWS_SECRET_ACCESS_KEY**
-
-Please add the `AWS_SECRET_ACCESS_KEY` variable to your `/etc/environment` or `.pam_environment`
-
-### BacMan
-
-#### BACMAN_BUCKET
-
-Please add the `BACMAN_BUCKET` variable to your `/etc/environment` or `.pam_environment`
-
-#### BACMAN_DIRECTORY
-
-- default: `/tmp/bacman`
-
-#### BACMAN_PREFIX
-
-- default (Postgres): `pgdump`
-- default (MySQL): `mysqldump`
-
-### Examples
-
-#### Example 1
-
-```python
-# /home/bacman/runbacman.py
-
-from bacman.postgres import Postgres
-
-# Uploads to remote AWS bucket
-# Removes old database snapshots that are older than 30 days (720 hrs)
-def main():
-  Postgres(to_remote=True, cleanup_local_snapshots=True)
-
-if __name__ == "__main__":
-  main()
-```
-
-#### Example 2
-
-```python
-# /home/bacman/runbacman.py
-
-from bacman.postgres import Postgres
-
-# Uploads to remote AWS bucket
-# Removes local snapshots that are older than 360 hrs
-# Removes remote snapshots that are older than 180 hours
-def main():
-  Postgres(to_remote=True, remote_snapshot_timeout=180, cleanup_local_snapshots=True, local_snapshot_timeout=360)
-
-if __name__ == "__main__":
-  main()
-```
-
-#### Crontab example
-
-Take a snapshot every 2 hours
-
-```
-0 */2 * * * ~/env/bin/python ~/runbacman.py >> /home/django/logs/crontab.log 2>&1
-```
-
-You can test run the script above by
-
-```
-$ chmod +x runbacman.py
-$ python runbacman.py
-```
+## Development
 
 ```bash
-# Open your crontab editor by typing crontab -e
-
-# m h  dom mon dow   command
-0 */2 * * * ~/env/bin/python ~/runbacman.py >> /home/bacman/logs/crontab.log 2>&1
+pip install -e . --group dev
+ruff check . && ruff format --check . && pytest
 ```
