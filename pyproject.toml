@@ -1,0 +1,53 @@
+[build-system]
+requires = ["hatchling>=1.27"]
+build-backend = "hatchling.build"
+
+[project]
+name = "bacman"
+dynamic = ["version"]
+description = "Take snapshots of Postgres and MySQL databases and upload them to AWS S3."
+readme = "README.md"
+requires-python = ">=3.11"
+license = "BSD-3-Clause"
+license-files = ["LICENCE"]
+authors = [{ name = "Will & Skill AB", email = "info@willandskill.se" }]
+keywords = ["backup", "database", "mysql", "postgres", "s3"]
+classifiers = [
+    "Development Status :: 5 - Production/Stable",
+    "Environment :: Console",
+    "Intended Audience :: System Administrators",
+    "Operating System :: POSIX",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Topic :: Database",
+    "Topic :: System :: Archiving :: Backup",
+]
+dependencies = ["boto3"]
+
+[project.urls]
+Homepage = "https://github.com/faisalmahmud/bacman"
+
+[project.scripts]
+bacman = "bacman.cli:main"
+
+[dependency-groups]
+dev = ["pytest>=8", "ruff"]
+
+[tool.hatch.version]
+path = "bacman/__init__.py"
+
+[tool.hatch.build.targets.sdist]
+include = ["bacman", "tests", "README.md", "LICENCE"]
+
+[tool.ruff]
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B", "SIM"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
